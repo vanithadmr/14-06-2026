@@ -401,3 +401,23 @@ body {
 @media (max-width: 480px) {
   .step-grid { grid-template-columns: 1fr; }
 }
+
+.gender-selector {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.gender-btn {
+  flex: 1;
+  padding: 12px;
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  background: var(--white);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: var(--text);
+}
+.gender-btn:hover { border-color: var(--pink-mid); }
+.gender-active { border-color: var(--pink) !important; background: var(--pink-light) !important; color: var(--pink) !important; }

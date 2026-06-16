@@ -1,130 +1,161 @@
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
+const express = require('express');
+const multer = require('multer');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const { spawn } = require('child_process');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
 
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
+
+const WAV2LIP_PATH = process.env.WAV2LIP_PATH || '/root/libsync/Wav2Lip';
+const CONDA_ENV    = process.env.WAV2LIP_ENV  || 'wav2lip';
+const CONDA_PATH   = process.env.CONDA_PATH   || '/root/miniconda3';
+const UPLOAD_DIR   = process.env.UPLOAD_DIR   || '/tmp/lipsync_uploads';
+const OUTPUT_DIR   = process.env.OUTPUT_DIR   || '/tmp/lipsync_outputs';
+const CHECKPOINT   = process.env.CHECKPOINT   || 'wav2lip.pth';
+
+[UPLOAD_DIR, OUTPUT_DIR].forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
 
 app.use(cors());
 app.use(express.json());
+app.use('/outputs', express.static(OUTPUT_DIR));
+app.use(express.static(path.join(__dirname, '../frontend/build')));
 
-// Storage for uploaded files
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = "./uploads";
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname}`);
-  },
+    const ext = path.extname(file.originalname) || '.jpg';
+    cb(null, `${uuidv4()}${ext}`);
+  }
 });
 
 const upload = multer({
   storage,
+  limits: { fileSize: 100 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ["image/jpeg", "image/png", "image/webp", "video/mp4"];
-    cb(null, allowed.includes(file.mimetype));
-  },
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+    const allowed = /\.(mp4|mov|avi|jpg|jpeg|png|webp|wav|mp3)$/i;
+    if (allowed.test(file.originalname)) cb(null, true);
+    else cb(new Error('Invalid file type'));
+  }
 });
 
-// Serve uploaded files
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+const jobs = {};
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+function textToSpeech(script, audioPath, gender = 'female') {
+  return new Promise((resolve, reject) => {
+    const voice = gender === 'male' ? 'en+m3' : 'en+f3';
+    const proc = spawn('espeak', [script, '--stdout', '-v', voice, '-s', '140', '-p', '50', '-a', '180']);
+    const out = fs.createWriteStream(audioPath);
+    proc.stdout.pipe(out);
+    let stderr = '';
+    proc.stderr.on('data', d => stderr += d.toString());
+    out.on('finish', () => {
+      if (fs.existsSync(audioPath) && fs.statSync(audioPath).size > 0) resolve(audioPath);
+      else reject(new Error('TTS produced empty audio'));
+    });
+    proc.on('error', reject);
+    proc.on('close', code => { if (code !== 0) reject(new Error(`espeak failed: ${stderr}`)); });
+  });
+}
 
-/**
- * POST /api/lipsync/generate
- * Accepts: image/video file + script text
- * Returns: job ID and status
- */
-app.post("/api/lipsync/generate", upload.single("avatar"), async (req, res) => {
+function runWav2Lip({ jobId, facePath, audioPath, outputPath }) {
+  return new Promise((resolve, reject) => {
+    const checkpointPath  = path.join(WAV2LIP_PATH, 'checkpoints', CHECKPOINT);
+    const pythonBin       = path.join(CONDA_PATH, 'envs', CONDA_ENV, 'bin', 'python');
+    const inferenceScript = path.join(WAV2LIP_PATH, 'inference.py');
+    const args = [
+      inferenceScript,
+      '--checkpoint_path', checkpointPath,
+      '--face',    facePath,
+      '--audio',   audioPath,
+      '--outfile', outputPath,
+      '--nosmooth',
+      '--resize_factor', '2'
+    ];
+    console.log(`[${jobId}] Spawning Wav2Lip...`);
+    const proc = spawn(pythonBin, args, {
+      cwd: WAV2LIP_PATH,
+      env: { ...process.env, PATH: `${CONDA_PATH}/envs/${CONDA_ENV}/bin:${process.env.PATH}` }
+    });
+    proc.stdout.on('data', d => {
+      const line = d.toString().trim();
+      jobs[jobId].log += line + '\n';
+      console.log(`[${jobId}]`, line);
+      const match = line.match(/(\d+)\/(\d+)/);
+      if (match) {
+        const pct = Math.round((parseInt(match[1]) / parseInt(match[2])) * 90);
+        jobs[jobId].progress = Math.max(jobs[jobId].progress, pct);
+      }
+    });
+    proc.stderr.on('data', d => { jobs[jobId].log += d.toString(); });
+    proc.on('close', code => {
+      if (code === 0 && fs.existsSync(outputPath)) resolve(outputPath);
+      else reject(new Error(`Wav2Lip exited with code ${code}`));
+    });
+    proc.on('error', reject);
+  });
+}
+
+async function runPipeline(jobId, facePath, script, gender = 'female') {
+  const audioPath  = path.join(UPLOAD_DIR, `${jobId}_audio.wav`);
+  const outputPath = path.join(OUTPUT_DIR,  `${jobId}_output.mp4`);
   try {
-    const { script, voiceId } = req.body;
-
-    if (!script || script.trim().length === 0) {
-      return res.status(400).json({ error: "Script text is required." });
-    }
-
-    if (!req.file) {
-      return res.status(400).json({ error: "Avatar image or video is required." });
-    }
-
-    // Simulate async lip sync job (replace with real API: D-ID, HeyGen, Sync.so)
-    const jobId = `lipsync_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-    // In production: call D-ID / HeyGen / Sync.so API here
-    // Example for D-ID:
-    // const response = await axios.post('https://api.d-id.com/talks', {
-    //   source_url: publicUrlOfUploadedFile,
-    //   script: { type: 'text', input: script, provider: { type: 'microsoft', voice_id: voiceId } }
-    // }, { headers: { Authorization: `Bearer ${process.env.DID_API_KEY}` } });
-
-    res.json({
-      success: true,
-      jobId,
-      status: "processing",
-      message: "Lip sync generation started.",
-      avatarUrl: `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`,
-      estimatedSeconds: 15,
-    });
-
-    // Simulate job completion after 15s (store to DB in production)
+    jobs[jobId].step = 'tts'; jobs[jobId].progress = 5;
+    await textToSpeech(script, audioPath, gender);
+    jobs[jobId].step = 'wav2lip'; jobs[jobId].progress = 10;
+    await runWav2Lip({ jobId, facePath, audioPath, outputPath });
+    jobs[jobId].status = 'done';
+    jobs[jobId].progress = 100;
+    jobs[jobId].videoUrl = `/outputs/${jobId}_output.mp4`;
+    console.log(`[${jobId}] Done -> ${jobs[jobId].videoUrl}`);
     setTimeout(() => {
-      console.log(`Job ${jobId} completed (simulated).`);
-    }, 15000);
+      [facePath, audioPath].forEach(f => { try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch(_){} });
+    }, 3600000);
   } catch (err) {
-    console.error("Generate error:", err);
-    res.status(500).json({ error: "Internal server error." });
+    jobs[jobId].status = 'error';
+    jobs[jobId].message = err.message;
+    console.error(`[${jobId}] Failed:`, err.message);
   }
+}
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', wav2lip: WAV2LIP_PATH, conda_env: CONDA_ENV, checkpoint: CHECKPOINT });
 });
 
-/**
- * GET /api/lipsync/status/:jobId
- * Poll for job completion
- */
-app.get("/api/lipsync/status/:jobId", (req, res) => {
-  const { jobId } = req.params;
-
-  // Simulate status (replace with real DB/Redis lookup)
-  const createdAt = parseInt(jobId.split("_")[1] || "0");
-  const elapsed = Date.now() - createdAt;
-  const done = elapsed > 15000;
-
-  if (done) {
-    res.json({
-      jobId,
-      status: "done",
-      // In production: return real video URL from D-ID / HeyGen
-      videoUrl: "https://www.w3schools.com/html/mov_bbb.mp4",
-      message: "Lip sync preview ready!",
-    });
-  } else {
-    res.json({
-      jobId,
-      status: "processing",
-      progress: Math.min(95, Math.floor((elapsed / 15000) * 100)),
-      message: "Processing lip sync...",
-    });
-  }
+app.post('/api/lipsync/generate', upload.single('avatar'), async (req, res) => {
+  const { script, gender } = req.body;
+  if (!req.file) return res.status(400).json({ error: 'Avatar file required' });
+  if (!script || !script.trim()) return res.status(400).json({ error: 'Script text required' });
+  const jobId    = uuidv4();
+  const facePath = req.file.path;
+  const avatarPreview = path.join(OUTPUT_DIR, path.basename(facePath));
+  fs.copyFileSync(facePath, avatarPreview);
+  jobs[jobId] = { id: jobId, status: 'processing', step: 'queued', progress: 0, videoUrl: null, message: null, log: '', createdAt: new Date().toISOString() };
+  res.status(202).json({ jobId, status: 'processing', avatarUrl: `/outputs/${path.basename(facePath)}` });
+  runPipeline(jobId, facePath, script.trim(), gender || 'female');
 });
 
-/**
- * POST /api/lipsync/save
- * Save lip sync settings for a session
- */
-app.post("/api/lipsync/save", (req, res) => {
-  const { jobId, voiceId, script } = req.body;
-  if (!jobId) return res.status(400).json({ error: "jobId is required." });
-
-  // Save to DB in production
-  res.json({ success: true, message: "Lip sync settings saved.", data: { jobId, voiceId, script } });
+app.get('/api/lipsync/status/:jobId', (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json({ jobId: job.id, status: job.status, progress: job.progress, videoUrl: job.videoUrl, message: job.message, step: job.step });
 });
 
-// ─── Health Check ─────────────────────────────────────────────────────────────
-app.get("/health", (_, res) => res.json({ status: "ok", service: "lipsync-backend" }));
+app.get('/api/jobs', (req, res) => {
+  res.json(Object.values(jobs).map(j => ({ id: j.id, status: j.status, progress: j.progress, step: j.step, videoUrl: j.videoUrl, createdAt: j.createdAt })));
+});
 
-app.listen(PORT, () => console.log(`🚀 Lip Sync backend running on http://localhost:${PORT}`));
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/build', 'index.html'));
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ LipSync backend running on http://0.0.0.0:${PORT}`);
+  console.log(`   Wav2Lip : ${WAV2LIP_PATH}`);
+  console.log(`   Env     : ${CONDA_ENV}`);
+});

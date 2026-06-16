@@ -47,7 +47,7 @@ export function useLipSync() {
   }, []);
 
   const generate = useCallback(
-    async ({ file, script, voiceId }) => {
+    async ({ file, script, voiceId, gender }) => {
       setError(null);
       setVideoUrl(null);
       setProgress(0);
@@ -56,7 +56,9 @@ export function useLipSync() {
       try {
         const formData = new FormData();
         if (file) formData.append("avatar", file);
+        formData.append("gender", gender || "female");
         formData.append("script", script);
+        formData.append("gender", gender || "female");
         if (voiceId) formData.append("voiceId", voiceId);
 
         const res = await fetch(`${API_BASE}/api/lipsync/generate`, {

@@ -1,0 +1,7 @@
+node_modules/
+frontend/build/
+backend/node_modules/
+frontend/node_modules/
+*.log
+.env
+Miniconda3-latest-Linux-x86_64.sh
